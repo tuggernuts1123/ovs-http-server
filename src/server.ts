@@ -33,6 +33,7 @@ import { redisClient,
   redisGetOnlinePlayers,
   redisGetOnlinePlayerCount,
   redisGetActiveRankedSets,
+  redisMarkP2PCapable,
   redisGetInProgressMatches } from "./config/redis";
 import { getLeaderboard, getPlayerRank, processMatchLeave, eloToTierDivision } from "./services/eloService";
 import { performGenuineLeave } from "./ssc/ssc";
@@ -1282,6 +1283,21 @@ app.get("/ovs/client-version", async (req, res) => {
   } catch (e) {
     logger.error(`${logPrefix} Error in /ovs/client-version: ${e}`);
     res.json({ latest_version: "", download_url: "", is_latest: true, release_name: "" });
+  }
+});
+
+// P2P capability heartbeat. The ASI pings this while its local rollback server
+// is running; we mark this IP P2P-capable for a short TTL. Matchmaking requires
+// every participant to be currently capable before routing a match to P2P, so a
+// player whose exe isn't running is put on the cloud server instead.
+app.get("/ovs/p2p-ready", async (req, res) => {
+  try {
+    const ip = tryGetRealIP(req).replace(/^::ffff:/, "");
+    if (ip) await redisMarkP2PCapable(ip);
+    res.json({ ok: true });
+  } catch (e) {
+    logger.error(`${logPrefix} Error in /ovs/p2p-ready: ${e}`);
+    res.json({ ok: false });
   }
 });
 

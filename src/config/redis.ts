@@ -418,6 +418,28 @@ export async function redisUpdatePlayerStatus(playerId: string, status: string) 
   await redisClient.hSet(`player:${playerId}`, { status: status });
 }
 
+// ── P2P capability heartbeat ──
+// The ASI heartbeats /ovs/p2p-ready while its local rollback server is running.
+// Keyed by IP (the rollback exe is per-machine). Matchmaking only routes a match
+// to P2P when every participant's IP is currently marked capable — so a player
+// whose exe never launched / crashed / was AV-killed silently stays on cloud.
+const P2P_CAPABLE_TTL_SECONDS = 30;
+
+export async function redisMarkP2PCapable(ip: string) {
+  if (!ip) return;
+  await redisClient.set(`p2p_capable:${ip}`, "1", { EX: P2P_CAPABLE_TTL_SECONDS });
+}
+
+export async function redisArePlayersP2PCapable(ips: string[]): Promise<boolean> {
+  const unique = [...new Set(ips.filter(Boolean))];
+  if (unique.length === 0) return false;
+  for (const ip of unique) {
+    const v = await redisClient.get(`p2p_capable:${ip}`);
+    if (!v) return false;
+  }
+  return true;
+}
+
 export async function redisUpdatePlayerKey(playerId: string, key: string, value: string) {
   const prop: Record<string, string> = {};
   prop[key] = value;

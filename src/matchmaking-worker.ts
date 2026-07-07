@@ -21,6 +21,7 @@ import { randomBytes } from "crypto";
 import { MATCH_TYPES, getBaseMode } from "./services/matchmakingService";
 import { getRandomMapByType } from "./data/maps";
 import { selectAuthority } from "./services/authoritySelector";
+import { redisArePlayersP2PCapable } from "./config/redis";
 import { randomUUID, randomInt } from "crypto";
 import { IDeployInfo, DeployInfo, getDefaultDeployInfo, useOnDemandRollback } from "./services/rollbackService";
 import { resolveAccountByIdentifiers } from "./services/identityService";
@@ -467,13 +468,29 @@ async function createMatch(tickets: RedisMatchTicket[], matchType: string): Prom
     const authority = selectAuthority(
       humanPeers.map((e) => ({ playerIndex: e.playerIndex, ip: e.ip })),
     );
-    if (authority.p2pMode > 0 && authority.hostIndex !== null) {
+
+    // Readiness gate: only actually route to P2P if EVERY participant is
+    // currently heartbeating a running local rollback server (p2p_capable). A
+    // player who downloaded the exe but isn't running it (crashed, AV-killed,
+    // blocked port, first launch mid-download) isn't capable → the match falls
+    // back to the cloud server. Cloud is always the safe baseline.
+    let finalMode = authority.p2pMode;
+    if (finalMode > 0) {
+      const allCapable = await redisArePlayersP2PCapable(humanPeers.map((e) => e.ip));
+      if (!allCapable) {
+        finalMode = 0;
+        logger.info(
+          `${logPrefix} Match ${matchId}: authority selected P2P but not all peers report a running rollback server — using cloud.`,
+        );
+      }
+    }
+    if (finalMode > 0 && authority.hostIndex !== null) {
       for (const e of teamEntries) {
         e.isHost = e.playerIndex === authority.hostIndex;
       }
     }
     logger.info(
-      `${logPrefix} Authority for match ${matchId}: ${authority.reason} (p2pMode=${authority.p2pMode})`,
+      `${logPrefix} Authority for match ${matchId}: ${authority.reason} (selected=${authority.p2pMode}, final=${finalMode})`,
     );
 
     const notification: MATCH_FOUND_NOTIFICATION = {
@@ -483,7 +500,7 @@ async function createMatch(tickets: RedisMatchTicket[], matchType: string): Prom
       map: await getRandomMapByType(matchType, matchId),
       mode: matchType,
       rollbackPort: match.rollbackPort,
-      p2pMode: authority.p2pMode,
+      p2pMode: finalMode,
     };
 
     if (useOnDemandRollback) {
