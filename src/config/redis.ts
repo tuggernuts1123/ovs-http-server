@@ -150,6 +150,10 @@ export interface MATCH_FOUND_NOTIFICATION extends MVS_NOTIFICATION {
   map: string;
   mode: string;
   rollbackPort: number;
+  // Rollback authority mode chosen for this match by the authority selector:
+  //   0 = cloud/dedicated (default), 1 = Preferred P2P, 2 = Forced P2P.
+  // Surfaced to the rollback server as `p2p_mode` in /ovs_register.
+  p2pMode?: number;
   // Custom game settings (injected into handleSendGamePlayConfig)
   isCustomGame?: boolean;
   customNumRingouts?: number;

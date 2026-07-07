@@ -518,6 +518,9 @@ app.post("/ovs_register", async (req, res, next) => {
   res.json({
     max_players: realPlayers.length,
     match_duration: 36000,
+    // Authority mode chosen by the matchmaker (0 cloud / 1 preferred-P2P /
+    // 2 forced-P2P). Absent/0 → the rollback server runs as today.
+    p2p_mode: config.p2pMode ?? 0,
     players,
   });
 
@@ -652,6 +655,7 @@ app.post("/mvsi_register", async (req, res, next) => {
   res.json({
     max_players: config.players.length,
     match_duration: 36000,
+    p2p_mode: config.p2pMode ?? 0,
     players,
   });
 

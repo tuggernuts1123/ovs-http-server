@@ -20,6 +20,7 @@ import ObjectID from "bson-objectid";
 import { randomBytes } from "crypto";
 import { MATCH_TYPES, getBaseMode } from "./services/matchmakingService";
 import { getRandomMapByType } from "./data/maps";
+import { selectAuthority } from "./services/authoritySelector";
 import { randomUUID, randomInt } from "crypto";
 import { IDeployInfo, DeployInfo, getDefaultDeployInfo, useOnDemandRollback } from "./services/rollbackService";
 import { resolveAccountByIdentifiers } from "./services/identityService";
@@ -454,13 +455,35 @@ async function createMatch(tickets: RedisMatchTicket[], matchType: string): Prom
     // Store match data
     await redisUpdateMatch(match.matchId, match);
 
+    const teamEntries = await createTeams(tickets);
+
+    // Per-match authority selection: pick the host + P2P mode that minimises the
+    // worst player's estimated latency. Returns cloud/dedicated (p2pMode 0, host
+    // untouched) unless a host peer clearly beats the cloud path — see
+    // authoritySelector.ts. Only human, team-side peers are candidates.
+    const humanPeers = teamEntries.filter(
+      (e) => !e.isSpectator && !e.isBot && e.playerIndex < 8888,
+    );
+    const authority = selectAuthority(
+      humanPeers.map((e) => ({ playerIndex: e.playerIndex, ip: e.ip })),
+    );
+    if (authority.p2pMode > 0 && authority.hostIndex !== null) {
+      for (const e of teamEntries) {
+        e.isHost = e.playerIndex === authority.hostIndex;
+      }
+    }
+    logger.info(
+      `${logPrefix} Authority for match ${matchId}: ${authority.reason} (p2pMode=${authority.p2pMode})`,
+    );
+
     const notification: MATCH_FOUND_NOTIFICATION = {
-      players: await createTeams(tickets),
+      players: teamEntries,
       matchId,
       matchKey: randomBytes(32).toString("base64"),
       map: await getRandomMapByType(matchType, matchId),
       mode: matchType,
       rollbackPort: match.rollbackPort,
+      p2pMode: authority.p2pMode,
     };
 
     if (useOnDemandRollback) {
