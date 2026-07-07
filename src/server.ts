@@ -1285,6 +1285,52 @@ app.get("/ovs/client-version", async (req, res) => {
   }
 });
 
+// Rollback-server exe auto-download. Mirrors /ovs/client-version: the ASI sends
+// its currently-installed rollback version (?v=), we return the latest release's
+// exe (or zip) download URL and whether the client is already current. The ASI
+// downloads it into the plugins folder on first launch / version bump.
+let cachedRollbackRelease: { data: any; fetchedAt: number } | null = null;
+const ROLLBACK_RELEASE_REPO = process.env.ROLLBACK_RELEASE_REPO || "openversus/ovs-rollback-server";
+
+app.get("/ovs/rollback-version", async (req, res) => {
+  try {
+    const localVersion = (req.query.v as string) || "";
+
+    if (!cachedRollbackRelease || Date.now() - cachedRollbackRelease.fetchedAt > GITHUB_CACHE_TTL) {
+      const ghRes = await fetch(`https://api.github.com/repos/${ROLLBACK_RELEASE_REPO}/releases/latest`, {
+        headers: { "User-Agent": "OpenVersus-Server", "Accept": "application/vnd.github+json" },
+      });
+      if (!ghRes.ok) {
+        logger.warn(`${logPrefix} rollback release API returned ${ghRes.status}`);
+        res.json({ latest_version: localVersion, download_url: "", is_latest: true, release_name: "" });
+        return;
+      }
+      cachedRollbackRelease = { data: await ghRes.json(), fetchedAt: Date.now() };
+    }
+
+    const release = cachedRollbackRelease.data;
+    const latestVersion = (release.tag_name || release.name || "").replace(/^v/i, "");
+    const assets: any[] = release.assets || [];
+
+    // Prefer a single-file .exe; fall back to a .zip package.
+    const exeAsset = assets.find((a: any) => a.name.toLowerCase().endsWith(".exe"))
+      || assets.find((a: any) => a.name.toLowerCase().endsWith(".zip"));
+    const downloadUrl = exeAsset?.browser_download_url || "";
+
+    const isLatest = localVersion !== "" && localVersion === latestVersion;
+
+    res.json({
+      latest_version: latestVersion,
+      download_url: downloadUrl,
+      is_latest: isLatest,
+      release_name: release.name || "",
+    });
+  } catch (e) {
+    logger.error(`${logPrefix} Error in /ovs/rollback-version: ${e}`);
+    res.json({ latest_version: "", download_url: "", is_latest: true, release_name: "" });
+  }
+});
+
 // ============================================================
 // /ovs/notifications — DLL polls this every 2s to receive queued
 // notifications (match_cancel, party invites, toasts, etc.)
