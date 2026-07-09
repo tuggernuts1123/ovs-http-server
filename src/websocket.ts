@@ -1532,6 +1532,18 @@ export class WebSocketService {
   async handleGameServerInstanceReady(notification: RedisGameServerInstanceReadyNotification) {
     let useCentralRollback = env.USE_INTERNAL_ROLLBACK === 1 ? true : false;
     let rollbackHost = useCentralRollback ? `${env.UDP_SERVER_IP}` : "127.0.0.1";
+
+    // P2P: when the matchmaker committed this match to host-authority P2P, point
+    // every participant's game at its OWN local rollback exe (127.0.0.1:<port>)
+    // instead of the cloud server. The local exe is the authority (host) or a
+    // proxy to the host (guest); it reaches the cloud coordinator for rendezvous.
+    const p2pMatchConfig = await redisGetMatchConfig(notification.containerMatchId);
+    const isP2P = ((p2pMatchConfig as any)?.p2pMode ?? 0) > 0;
+    const p2pLocalPort = Number(process.env.P2P_LOCAL_PORT ?? 47800);
+    if (isP2P) {
+      rollbackHost = "127.0.0.1";
+    }
+
     let playerClients: Record<string, WebSocketPlayer>[] = [];
 
     for (const playerId of notification.playerIds) {
@@ -1551,9 +1563,9 @@ export class WebSocketService {
       // const client = this.clients.get(playerId);
       const client = playerClients.find(pc => pc[playerId])?.[playerId];
 
-      const gameServerPort = notification.rollbackPort || GAME_SERVER_PORT;
+      const gameServerPort = isP2P ? p2pLocalPort : (notification.rollbackPort || GAME_SERVER_PORT);
       logger.info(
-        `[${serviceName}]: Received game server instance ready for match ${notification.containerMatchId} and player ${playerId} with IP ${client?.ip ?? "unknown"} and name ${client?.account?.username ?? "unknown"}, sending game server info with port ${gameServerPort}`,
+        `[${serviceName}]: Received game server instance ready for match ${notification.containerMatchId} and player ${playerId} with IP ${client?.ip ?? "unknown"} and name ${client?.account?.username ?? "unknown"}, sending game server ${rollbackHost}:${gameServerPort}${isP2P ? " (P2P local)" : ""}`,
       );
 
       const message = {

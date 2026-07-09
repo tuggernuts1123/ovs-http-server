@@ -522,6 +522,9 @@ app.post("/ovs_register", async (req, res, next) => {
     // Authority mode chosen by the matchmaker (0 cloud / 1 preferred-P2P /
     // 2 forced-P2P). Absent/0 → the rollback server runs as today.
     p2p_mode: config.p2pMode ?? 0,
+    // The rendezvous/coordinator the local exes register with for hole punching:
+    // the cloud rollback server for this match. Empty when not P2P.
+    coordinator: (config.p2pMode ?? 0) > 0 ? `${env.UDP_SERVER_IP}:${config.rollbackPort}` : "",
     players,
   });
 
