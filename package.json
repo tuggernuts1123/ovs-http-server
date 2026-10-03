@@ -6,6 +6,7 @@
     "websocket": "node -r @swc-node/register ./src/websocketStart.ts",
     "worker": "node -r @swc-node/register ./src/workerStart.ts",
     "test": "node -r @swc-node/register ./src/game/udpTest.ts",
+    "test:p2p": "tsx --test tests/p2pSecurity.test.ts",
     "build": "tsc --project ./ && cp -R src/ build/",
     "start:prod": "node ./build/index.js"
   },

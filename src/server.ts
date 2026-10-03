@@ -74,6 +74,7 @@ import { NameGenerator } from "./utils/namegeneration";
 import { handleDeployRollbackServer, handleDestroyRollbackServer } from "./handlers/testing";
 import { handleMatchStatusUpdate } from "./handlers/match_status";
 import { resolveAccountFromRequest, resolveAccountWithSource } from "./services/identityService";
+import { isValidCoordinatorSecret } from "./services/p2pSecurity";
 import { initAccelByteLobbyWs, accelByteLobbyWs } from "./accelByteLobbyWs";
 import { IMatchStatus } from "./interfaces/IMatchStatus";
 import { REAL_IP_HEADER, getRealIP, tryGetRealIP } from "./middleware/auth";
@@ -638,6 +639,61 @@ app.post(["/ovs_match_status", "/api/ovs_match_status"], async (req, res) => {
     return;
   }
   res.json({ status: "ok" });
+});
+
+// Reported by the cloud P2P COORDINATOR (the trusted rollback server) when a
+// peer stops sending keepalives mid-match while another peer is still alive —
+// i.e. that peer is the leaver. Authenticated by MatchUpdateKey, so the signal
+// is trusted (a player's own exe can't forge it). This is the authoritative
+// dodge signal for P2P matches: it fires even if the victim never closes their
+// WebSocket, and it protects the still-alive peer from being blamed.
+app.post(["/ovs_p2p_peer_dropped", "/api/ovs_p2p_peer_dropped"], async (req, res) => {
+  if (!isValidCoordinatorSecret(req.header("MatchUpdateKey"), MATCH_UPDATE_KEY)) {
+    logger.warn(`${logPrefix} POST /api/ovs_p2p_peer_dropped rejected: missing or invalid MatchUpdateKey`);
+    res.status(403).json({ error: "Invalid signature" });
+    return;
+  }
+
+  const matchId: string | undefined = req.body?.matchId;
+  const droppedIndex = req.body?.droppedIndex;
+  if (!matchId || droppedIndex === undefined || droppedIndex === null) {
+    res.status(400).json({ error: "Missing matchId or droppedIndex" });
+    return;
+  }
+
+  const config = await redisGetMatchConfig(matchId).catch(() => null);
+  if (!config) {
+    logger.warn(`${logPrefix} P2P peer-drop for unknown match ${matchId}`);
+    res.json({ status: "unknown_match" });
+    return;
+  }
+
+  if ((config.p2pMode ?? 0) <= 0) {
+    logger.warn(`${logPrefix} P2P peer-drop rejected for non-P2P match ${matchId}`);
+    res.status(409).json({ error: "Match is not using P2P" });
+    return;
+  }
+
+  if (!(await redisClient.get(`match_started:${matchId}`))) {
+    logger.warn(`${logPrefix} P2P peer-drop rejected before match start for ${matchId}`);
+    res.status(409).json({ error: "Match has not started" });
+    return;
+  }
+
+  const dropped = config.players.find((p) => Number(p.playerIndex) === Number(droppedIndex));
+  if (!dropped || dropped.isSpectator || dropped.isBot) {
+    logger.warn(`${logPrefix} P2P peer-drop match ${matchId} — no player with index ${droppedIndex}`);
+    res.json({ status: "unknown_peer" });
+    return;
+  }
+
+  logger.info(`${logPrefix} P2P peer-drop reported: match ${matchId} idx ${droppedIndex} → ${dropped.playerId} (leaver)`);
+  const { processP2PForfeit } = await import("./services/p2pForfeit.js");
+  const processed = await processP2PForfeit(matchId, dropped.playerId, "coordinator-keepalive").catch((e: unknown) => {
+    logger.error(`${logPrefix} Error processing P2P forfeit for ${matchId}: ${e}`);
+    return false;
+  });
+  res.json({ status: processed ? "forfeit_processed" : "ignored" });
 });
 
 // Being kept for backwards compatibility with older OVS versions, can be removed eventually
@@ -1289,14 +1345,26 @@ app.get("/ovs/client-version", async (req, res) => {
   }
 });
 
-// P2P capability heartbeat. The ASI pings this while its local rollback server
-// is running; we mark this IP P2P-capable for a short TTL. Matchmaking requires
-// every participant to be currently capable before routing a match to P2P, so a
-// player whose exe isn't running is put on the cloud server instead.
+// P2P capability heartbeat. The ASI sends its platform/device identity while
+// its local rollback server is running. We resolve that identity to the active
+// account and require the heartbeat to come from the account's current IP.
 app.get("/ovs/p2p-ready", async (req, res) => {
   try {
-    const ip = tryGetRealIP(req).replace(/^::ffff:/, "");
-    if (ip) await redisMarkP2PCapable(ip);
+    const { conn, source } = await resolveAccountWithSource(req);
+    if (!conn?.id || source === "ip" || source === "unresolved") {
+      res.status(401).json({ ok: false, error: "Player identity required" });
+      return;
+    }
+
+    const requestIp = tryGetRealIP(req).replace(/^::ffff:/, "");
+    const accountIp = (conn.current_ip || "").replace(/^::ffff:/, "");
+    if (!requestIp || !accountIp || requestIp !== accountIp) {
+      logger.warn(`${logPrefix} Rejected P2P readiness for ${conn.id}: request IP does not match active connection`);
+      res.status(403).json({ ok: false, error: "Identity does not match active connection" });
+      return;
+    }
+
+    await redisMarkP2PCapable(conn.id);
     res.json({ ok: true });
   } catch (e) {
     logger.error(`${logPrefix} Error in /ovs/p2p-ready: ${e}`);

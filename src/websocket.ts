@@ -96,6 +96,7 @@ import { Cosmetics, TauntSlotsClass, defaultTaunts, IDefaultTaunts } from "./dat
 import { getEquippedCosmetics } from "./services/cosmeticsService";
 import { cancelMatchmakingForAll } from "./services/matchmakingService";
 import { processMatchLeave, getOrCreateRating, eloToTierDivision } from "./services/eloService";
+import { processP2PForfeit } from "./services/p2pForfeit";
 import { PlayerTesterModel } from "./database/PlayerTester";
 import { PlayerStatsModel } from "./database/PlayerStats";
 import { INVENTORY_DEFINITIONS } from "./data/inventoryDefs";
@@ -104,6 +105,11 @@ import { adjustMatchToasts } from "./data/playerCounters";
 
 const serviceName: string = "WebSocket";
 const logPrefix = `[${serviceName}]:`;
+
+// Grace window before finalizing a P2P mid-match forfeit. If a SECOND player
+// also leaves within this window (host-exe crash freezing both games), the
+// forfeit is voided as a no-contest instead of penalizing whoever quit first.
+const P2P_DODGE_GRACE_MS = 6000;
 
 export class WebSocketPlayer {
   init: boolean = false;
@@ -446,9 +452,19 @@ export class WebSocketService {
         if (matchId) {
           const gameResultReceived = await redisClient.get(`game_result_received:${matchId}`);
           const matchStarted = await redisClient.get(`match_started:${matchId}`);
+          const wsMatchConfig = await redisGetMatchConfig(matchId).catch(() => null);
+          const isP2PMatch = (wsMatchConfig?.p2pMode ?? 0) > 0;
 
           if (gameResultReceived) {
             logger.info(`[${serviceName}]: Skipping WS dodge for ${playerId} — game ${matchId} already has a result (normal post-game disconnect)`);
+          } else if (isP2PMatch && matchStarted && wsMatchConfig && !wsMatchConfig.isCustomGame) {
+            // P2P (host-authority): the opponent's game may be frozen (the host's
+            // local rollback exe left/died), so the usual "concede when the remaining
+            // player hits READY" path can't fire and the dodger would escape. Resolve
+            // the forfeit directly — first player to leave with no result loses ELO —
+            // with a short mutual-disconnect crash guard. See resolveP2PMatchLeave.
+            logger.info(`[${serviceName}]: P2P match ${matchId} — ${playerId} left with no result, resolving forfeit`);
+            await this.resolveP2PMatchLeave(matchId, playerId);
           } else if (matchStarted) {
             // Mid-game: set disconnect flag so auto-concede fires when remaining player hits READY
             logger.info(`[${serviceName}]: Player ${playerId} disconnected mid-match ${matchId} — flagging for auto-concede (remaining player finishes game)`);
@@ -641,6 +657,112 @@ export class WebSocketService {
       await redisPopMatchTicketsFromQueue("1v1", [playerWS.ticket]);
       await redisPopMatchTicketsFromQueue("2v2", [playerWS.ticket]);
     }
+  }
+
+  /**
+   * Handle a WebSocket close for a player in a P2P (host-authority) match.
+   *
+   * In P2P the rollback authority runs on the host's own machine. If the host
+   * leaves (Alt-F4), the guest's game freezes and can never reach the "READY"
+   * that normally triggers the concede flow — so the standard mid-game path
+   * would let the dodger escape. We resolve the forfeit here instead: the FIRST
+   * player to leave (WS close, no game result) loses ELO and the opponent wins.
+   *
+   * Crash guard: if the host's exe simply CRASHES (not a deliberate quit), both
+   * games freeze and both players may rage-quit. We don't want to penalize
+   * whoever quit first for a server crash, so we DEFER the penalty a few seconds;
+   * if a SECOND player also leaves in that window (or a real result arrives) we
+   * void it as a no-contest. The deferral is an in-process timer — a backend
+   * restart inside the grace window drops the pending penalty (the
+   * `ranked_disconnect` flag is still cleaned up on next login), an acceptable
+   * rare edge.
+   */
+  private async resolveP2PMatchLeave(matchId: string, playerId: string): Promise<void> {
+    try {
+      // Flag for the standard cleanup/concede paths too (harmless if unused).
+      await redisClient.set(`ranked_disconnect:${playerId}`, "1", { EX: 600 });
+
+      const pendingKey = `p2p_dodge_pending:${matchId}`;
+      const claimed = await redisClient.set(pendingKey, playerId, { NX: true, EX: 30 });
+      if (claimed !== "OK") {
+        // Someone already left this match without a result.
+        const firstLeaver = await redisClient.get(pendingKey);
+        if (firstLeaver && firstLeaver !== playerId) {
+          // Two different players gone, no result → mutual disconnect / server
+          // crash. Void the pending penalty; nobody loses ELO.
+          await redisClient.set(`match_server_crash:${matchId}`, "1", { EX: 600 });
+          logger.warn(
+            `[${serviceName}]: Mutual P2P disconnect in ${matchId} (${firstLeaver} + ${playerId}) — treating as no-contest, no ELO`,
+          );
+        }
+        return;
+      }
+
+      logger.info(
+        `[${serviceName}]: P2P leave by ${playerId} in ${matchId} — scheduling forfeit resolution (${P2P_DODGE_GRACE_MS}ms crash guard)`,
+      );
+      setTimeout(() => {
+        void this.finalizeP2PDodge(matchId, playerId).catch((err) =>
+          logger.error(`[${serviceName}]: finalizeP2PDodge error for ${matchId}: ${err}`),
+        );
+      }, P2P_DODGE_GRACE_MS);
+    } catch (e) {
+      logger.error(`[${serviceName}]: resolveP2PMatchLeave error for ${matchId}: ${e}`);
+    }
+  }
+
+  /**
+   * After the crash-guard window, finalize a P2P forfeit: penalize the leaver
+   * and award the opponent — UNLESS the game has since produced a result, the
+   * match was flagged a crash/mutual disconnect, or no opponent is still
+   * connected (everyone's gone → crash, not a dodge).
+   */
+  private async finalizeP2PDodge(matchId: string, leaverId: string): Promise<void> {
+    // Abort if the game finished normally during the grace window.
+    if (await redisClient.get(`game_result_received:${matchId}`)) return;
+    // Abort if a mutual disconnect already flagged this as a crash.
+    if (await redisClient.get(`match_server_crash:${matchId}`)) return;
+    // Abort if superseded (defensive).
+    if ((await redisClient.get(`p2p_dodge_pending:${matchId}`)) !== leaverId) return;
+
+    // Defer to the coordinator's keepalive verdict. If it named a DIFFERENT peer
+    // as first-to-go-silent, THIS player is the victim (their game froze when the
+    // host's exe died and they quit after) — never penalize them.
+    const firstDropped = await redisClient.get(`p2p_first_dropped:${matchId}`);
+    if (firstDropped && firstDropped !== leaverId) {
+      logger.info(
+        `[${serviceName}]: P2P victim protection — ${leaverId} left ${matchId} but coordinator reports ${firstDropped} dropped first; no penalty`,
+      );
+      return;
+    }
+
+    const matchConfig = await redisGetMatchConfig(matchId).catch(() => null);
+    if (!matchConfig || matchConfig.isCustomGame) return;
+
+    const leaver = matchConfig.players.find((p) => p.playerId === leaverId);
+    if (!leaver || leaver.isSpectator) return;
+
+    // At least one opponent must still be connected — otherwise everyone left
+    // (crash / mass disconnect), which is a no-contest, not a dodge.
+    const opponents = matchConfig.players.filter(
+      (p) =>
+        p.playerId !== leaverId &&
+        !p.isSpectator &&
+        !p.isBot &&
+        p.teamIndex !== leaver.teamIndex,
+    );
+    const anyOpponentPresent = opponents.some((p) => this.clients.has(p.playerId));
+    if (!anyOpponentPresent) {
+      await redisClient.set(`match_server_crash:${matchId}`, "1", { EX: 600 });
+      logger.warn(
+        `[${serviceName}]: P2P forfeit for ${leaverId} in ${matchId} aborted — no opponent still connected (treating as crash)`,
+      );
+      return;
+    }
+
+    // Hand off the actual ELO + cleanup to the shared resolver (also used by the
+    // coordinator-driven /api/ovs_p2p_peer_dropped endpoint).
+    await processP2PForfeit(matchId, leaverId, "ws-close");
   }
 
   setupSocketHandlers() {

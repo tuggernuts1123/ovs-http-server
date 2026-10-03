@@ -476,7 +476,7 @@ async function createMatch(tickets: RedisMatchTicket[], matchType: string): Prom
     // back to the cloud server. Cloud is always the safe baseline.
     let finalMode = authority.p2pMode;
     if (finalMode > 0) {
-      const allCapable = await redisArePlayersP2PCapable(humanPeers.map((e) => e.ip));
+      const allCapable = await redisArePlayersP2PCapable(humanPeers.map((e) => e.playerId));
       if (!allCapable) {
         finalMode = 0;
         logger.info(
