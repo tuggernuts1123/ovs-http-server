@@ -48,10 +48,16 @@ test("no relay region when a player's latency is unknown", () => {
   assert.equal(pickRelayRegion([], US, placed), null);
 });
 
-test("selection is off unless P2P_SELECTION_ENABLED=1, but still reports the region", () => {
-  const d = withSelection({ P2P_SELECTION_ENABLED: undefined }, () => selectAuthority(players("seattle", "portland"), placed, US));
+test("selection is off unless P2P_SELECTION_ENABLED=1, and then looks nothing up", () => {
+  let lookups = 0;
+  const counting: LatencySource = {
+    playerToRegion: (p, r) => (lookups++, placed.playerToRegion(p, r)),
+    playerToPlayer: (a, b) => (lookups++, placed.playerToPlayer(a, b)),
+  };
+  const d = withSelection({ P2P_SELECTION_ENABLED: undefined }, () => selectAuthority(players("seattle", "portland"), counting, US));
   assert.equal(d.p2pMode, 0);
-  assert.equal(d.regionId, "us-west-2");
+  assert.equal(d.regionId, null);
+  assert.equal(lookups, 0);
 });
 
 test("P2P only when a host beats the best region by the margin", () => {
@@ -72,6 +78,12 @@ test("unknown latency or too many peers stays on cloud", () => {
   withSelection({ P2P_SELECTION_ENABLED: "1", P2P_SELECTION_MAX_PEERS: "2" }, () => {
     assert.equal(selectAuthority(players("seattle", "nowhere"), placed, US).p2pMode, 0);
     assert.equal(selectAuthority(players("seattle", "portland", "boston"), placed, US).p2pMode, 0);
+  });
+});
+
+test("a peer cap that isn't a number falls back to the default of 2", () => {
+  withSelection({ P2P_SELECTION_ENABLED: "1", P2P_SELECTION_MAX_PEERS: "two" }, () => {
+    assert.equal(selectAuthority(players("seattle", "portland", "boston"), placed, [region("us-east-1")]).p2pMode, 0);
   });
 });
 

@@ -35,15 +35,23 @@ import { logger } from "../config/logger";
 
 const logPrefix = "[Services.AuthoritySelector]:";
 
-// geoip-lite is an offline dependency (bundled MaxMind GeoLite data). Loaded
-// lazily and guarded so the server still boots (and simply never picks P2P) if
-// the package or its data isn't present.
-let geoip: { lookup: (ip: string) => { ll?: [number, number] } | null } | null = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  geoip = require("geoip-lite");
-} catch {
-  logger.warn(`${logPrefix} geoip-lite not available; P2P authority selection will stay on cloud.`);
+// geoip-lite is an offline dependency (bundled MaxMind GeoLite data, held in
+// memory once loaded). Loaded on first use, so a server with selection off never
+// pays for it, and guarded so the server still runs (and simply never picks P2P)
+// if the package or its data isn't present.
+type GeoIp = { lookup: (ip: string) => { ll?: [number, number] } | null };
+let geoip: GeoIp | null | undefined;
+function geoipModule(): GeoIp | null {
+  if (geoip === undefined) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      geoip = require("geoip-lite") as GeoIp;
+    } catch {
+      geoip = null;
+      logger.warn(`${logPrefix} geoip-lite not available; P2P authority selection will stay on cloud.`);
+    }
+  }
+  return geoip;
 }
 
 export type P2PMode = 0 | 1 | 2; // Off | Preferred | Forced
@@ -146,11 +154,16 @@ interface SelectionConfig {
   maxPeers: number;
 }
 
+function numberSetting(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return raw !== undefined && raw.trim() !== "" && Number.isFinite(n) ? n : fallback;
+}
+
 function selectionConfig(): SelectionConfig {
   return {
     enabled: process.env.P2P_SELECTION_ENABLED === "1",
-    marginMs: Number(process.env.P2P_SELECTION_MARGIN_MS ?? 25),
-    maxPeers: Number(process.env.P2P_SELECTION_MAX_PEERS ?? 2),
+    marginMs: numberSetting(process.env.P2P_SELECTION_MARGIN_MS, 25),
+    maxPeers: numberSetting(process.env.P2P_SELECTION_MAX_PEERS, 2),
   };
 }
 
@@ -182,9 +195,10 @@ function haversineKm(a: LatLon, b: LatLon): number {
 const deg2rad = (d: number) => (d * Math.PI) / 180;
 
 function geoForIp(ip: string): LatLon | null {
-  if (!geoip || !ip) return null;
+  const geo = ip ? geoipModule() : null;
+  if (!geo) return null;
   try {
-    const g = geoip.lookup(ip);
+    const g = geo.lookup(ip);
     if (g && Array.isArray(g.ll) && g.ll.length === 2) {
       const [lat, lon] = g.ll;
       if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat, lon };
@@ -244,6 +258,10 @@ export function selectAuthority(
   regions: Region[] = configuredRegions(),
 ): AuthorityDecision {
   const config = selectionConfig();
+  // Off (the default): no lookups at all, so matches run exactly as before.
+  if (!config.enabled) {
+    return { p2pMode: 0, hostIndex: null, regionId: null, reason: "cloud (selection disabled)", estWorstMs: 0 };
+  }
   const relay = pickRelayRegion(players, regions, latency);
   const cloud: AuthorityDecision = {
     p2pMode: 0,
@@ -253,7 +271,6 @@ export function selectAuthority(
     estWorstMs: relay ? Math.round(relay.worstMs) : 0,
   };
 
-  if (!config.enabled) return { ...cloud, reason: "cloud (selection disabled)" };
   if (players.length < 2) return { ...cloud, reason: "cloud (<2 peers)" };
   if (players.length > config.maxPeers) {
     return { ...cloud, reason: `cloud (>${config.maxPeers} peers)` };

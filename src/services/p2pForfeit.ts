@@ -50,6 +50,10 @@ export async function processP2PForfeit(matchId: string, leaverId: string, reaso
   const canProcess = await redisClient.set(`elo_processed_set:${setId}`, "p2p_forfeit", { NX: true, EX: 300 });
   if (canProcess !== "OK") return false;
   await redisClient.set(`elo_processed:${matchId}`, "1", { NX: true, EX: 300 });
+  // The forfeit is this match's result. Recorded for as long as the match config
+  // lives (20 min), so the winner's later disconnect, from the config still on
+  // their socket, isn't taken for a pregame dodge.
+  await redisClient.set(`game_result_received:${matchId}`, "1", { EX: 60 * 20 });
 
   const winnerTeam = leaver.teamIndex === 0 ? 1 : 0;
   const team0Ids = matchConfig.players.filter((p) => p.teamIndex === 0 && !p.isSpectator).map((p) => p.playerId);
